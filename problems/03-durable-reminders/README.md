@@ -1,164 +1,286 @@
-# Problem 3: Durable Reminders and Follow-Ups
+# Durable Reminders and Scheduled Follow-Ups
 
-## Context
+A small, maintainable service for scheduling reminders and follow-ups that survives process restarts, handles retries with bounded policies, enforces idempotent delivery, and correctly converts time zones including daylight-saving boundaries.
 
-A conversational companion may promise, “I’ll remind you tomorrow morning” or “Let’s continue this conversation on Friday.” That promise must survive a process restart, respect the user’s time zone, and remain correct when delivery fails or the user edits or cancels it.
+## Project Overview
 
-A scheduler firing twice is normal in many systems. The product must still avoid two logical notifications for the same scheduled occurrence.
+This service allows creating scheduled reminders/follow-ups with:
+- **IANA time zone support** — schedules are specified in local time with a named zone
+- **Durable scheduling** — the database is the source of truth, not in-memory timers
+- **Restart recovery** — overdue work is discovered and processed after restarts
+- **Bounded retry** — temporary delivery failures are retried up to a configurable limit
+- **Idempotent delivery** — duplicate execution never produces duplicate logical notifications
+- **Safe editing & cancellation** — version-based race detection prevents stale deliveries
 
-## Your objective
+## Architecture
 
-Build a small service for reminders and scheduled conversational follow-ups that remains correct across restarts and retries.
+```
+REST API (ReminderController)
+    ↓
+Service Layer
+    ├── ReminderService      — CRUD, timezone conversion, state validation
+    ├── DueWorkService       — discovery, claiming, restart recovery
+    └── DeliveryService      — delivery attempts, retry logic, race detection
+            ↓
+Repository Layer
+    ├── ScheduledWorkRepository    — due-work queries, conditional claim
+    └── DeliveryAttemptRepository  — attempt history
+            ↓
+PostgreSQL (source of truth)
 
-This exercise evaluates durable workflow state, scheduling, time handling, idempotency, retry policy, cancellation, and operational history. A distributed workflow platform is not expected.
+Background Scheduler (SchedulerConfig)
+    ↓
+DueWorkService.processDueWork()
+    ↓
+DeliveryService.attemptDelivery()
+    ↓
+FakeNotificationDestination (idempotent delivery boundary)
+```
 
-## Minimum scheduled-work contract
+## Setup
 
-Each item should have equivalent concepts for:
+### Prerequisites
+- Java 21
+- Docker (for PostgreSQL)
+- Gradle (wrapper included)
 
-- A stable identifier
-- Reminder or follow-up content
-- A scheduled instant and an IANA time-zone identifier such as `Asia/Kolkata` or `America/New_York`
-- A state such as scheduled, running, delivered, cancelled, or failed
-- A version or equivalent mechanism for safe edits
-- Ordered execution-attempt history
-- A stable delivery key for idempotency
+### 1. Start PostgreSQL
 
-Use an injectable clock and a fake or local notification destination so reviewers can run time-dependent behaviour quickly and deterministically.
+```bash
+docker-compose up -d
+```
 
-## Required behaviour
+This starts PostgreSQL on port 5432 with:
+- Database: `reminders_db`
+- User: `postgres`
+- Password: `postgres`
 
-Your service must support:
+### 2. Configure Environment Variables (optional)
 
-1. Creating and inspecting scheduled work
-2. Editing the time or content before delivery
-3. Cancelling scheduled work before delivery
-4. Interpreting and retaining an IANA time zone, with a documented policy for ambiguous or nonexistent local times
-5. Discovering and executing due work after a service restart
-6. Recording every delivery attempt and its outcome
-7. Retrying documented temporary failures with a bounded policy
-8. Reaching a visible terminal state when retries are exhausted
-9. Preventing duplicate logical delivery when the same occurrence is executed more than once
-10. Defining deterministic behaviour for an edit or cancellation racing with execution
+The defaults in `application.yml` match the docker-compose configuration. Override if needed:
 
-A REST API, CLI, small interface, or combination is acceptable.
+```bash
+export SPRING_DATASOURCE_URL=jdbc:postgresql://localhost:5432/reminders_db
+export SPRING_DATASOURCE_USERNAME=postgres
+export SPRING_DATASOURCE_PASSWORD=postgres
+```
 
-## Acceptance scenarios
+### 3. Build and Run
 
-### AC1: Scheduled delivery
+```bash
+# Build
+./gradlew build
 
-- **Given** an active reminder in a named time zone
-- **When** the injected clock reaches its scheduled instant
-- **Then** one notification is delivered and the item reaches delivered state with recorded history
+# Run
+./gradlew bootRun
+```
 
-### AC2: Restart recovery
+### 4. Open Swagger UI
 
-- **Given** an active reminder becomes due while the service is stopped
-- **When** the service restarts
-- **Then** it discovers and processes the overdue work according to a documented policy
+Navigate to: [http://localhost:8080/swagger-ui.html](http://localhost:8080/swagger-ui.html)
 
-### AC3: Temporary failure
+## REST API
 
-- **Given** the notification destination temporarily fails
-- **When** delivery is attempted
-- **Then** the failure is recorded, retry is bounded, and eventual success or terminal failure is visible
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/v1/reminders` | Create a new reminder |
+| GET | `/api/v1/reminders/{id}` | Get reminder with attempt history |
+| PUT | `/api/v1/reminders/{id}` | Update content/schedule (increments version) |
+| POST | `/api/v1/reminders/{id}/cancel` | Cancel a reminder |
+| POST | `/api/v1/reminders/process-due` | Manually trigger due-work processing |
 
-### AC4: Duplicate execution
+### Create Reminder Example
 
-- **Given** the same scheduled occurrence is claimed or executed more than once
-- **When** the delivery path runs repeatedly
-- **Then** the destination observes one logical notification for that occurrence
+```json
+POST /api/v1/reminders
+{
+  "content": "Call Mom",
+  "localDateTime": "2026-09-20T18:00:00",
+  "timeZone": "Asia/Kolkata"
+}
+```
 
-### AC5: Edit before execution
+## Testing
 
-- **Given** a scheduled item has not completed
-- **When** the user changes its time or content
-- **Then** the effective version is clear and the superseded schedule does not later produce an unexpected notification
+```bash
+./gradlew test
+```
 
-### AC6: Cancellation
+Tests use H2 in-memory database and an injectable Clock — no Docker, no real-time waits.
 
-- **Given** an active item is cancelled before delivery commits
-- **When** workers continue polling or retrying
-- **Then** the documented cancellation policy is enforced and no later successful delivery is incorrectly recorded
+### Test Coverage
 
-### AC7: Time-zone boundary
+| # | Test | Description |
+|---|------|-------------|
+| 1 | Due-work discovery | Verifies work is found only when clock reaches scheduled time |
+| 2 | Restart recovery | Simulates overdue work discovered after restart |
+| 3 | Temporary failure + retry | First attempt fails, retry succeeds |
+| 4 | Retry exhaustion | All 3 attempts fail → FAILED state |
+| 5 | Duplicate execution | Same occurrence executed twice → one logical notification |
+| 6 | Edit before execution | Version incremented, old delivery key invalidated |
+| 7 | Cancellation before execution | Cancelled work never produces notifications |
+| 8 | Edit-vs-execution race | Worker with stale version detects mismatch |
+| 9 | Cancel-vs-execution race | Cancellation wins before delivery commits |
+| 10 | Asia/Kolkata timezone | 18:00 IST → 12:30 UTC |
+| 11 | America/New_York timezone | 14:00 EDT → 18:00 UTC |
+| 12 | DST spring-forward | Nonexistent 2:30 AM → shifted to 3:00 AM |
+| 12b | DST fall-back | Ambiguous 1:30 AM → earlier offset chosen |
 
-- **Given** reminders use different IANA time zones, including one daylight-saving boundary
-- **When** their local requested times are converted
-- **Then** their execution instants are deterministic and documented
+## Verification Benchmark
 
-## Required tests
+```bash
+./gradlew test --tests "com.example.reminders.VerificationBenchmarkTest"
+```
 
-Include deterministic automated tests for:
+The benchmark:
+1. Creates 21 items across Asia/Kolkata and America/New_York
+2. Includes delivered, edited, cancelled, temp-failing, and perm-failing items
+3. Simulates restart recovery (RUNNING → SCHEDULED)
+4. Simulates duplicate execution for one occurrence
+5. Advances the injectable clock through multiple processing cycles
+6. Reports counts by terminal state
+7. Verifies every delivered occurrence produced exactly one logical notification
 
-- Due-work discovery using an injected clock
-- Restart recovery for overdue work
-- Temporary failure followed by retry
-- Retry exhaustion
-- Duplicate execution or duplicate acknowledgement
-- Editing and cancelling before execution
-- At least two IANA time zones and one daylight-saving boundary case
+## Design Decisions
 
-Tests should not wait for real minutes to pass or call a paid notification provider.
+### Why is `scheduled_at` an Instant?
 
-## Verification benchmark
+An `Instant` is an unambiguous point on the timeline. Polling compares `scheduled_at <= clock.instant()` without any timezone conversion. The IANA zone is retained separately for display and audit purposes.
 
-Provide one repeatable command or documented sequence that:
+### Why retain `time_zone`?
 
-1. Creates at least **20 scheduled items** across at least **two IANA time zones**
-2. Includes delivered, edited, cancelled, temporarily failing, and permanently failing items
-3. Stops and restarts the service before processing all due work
-4. Simulates duplicate execution for at least one occurrence
-5. Advances an injected clock until processing settles
-6. Reports counts by terminal state and demonstrates that every active successful occurrence produced exactly one logical notification
+The original timezone is preserved for:
+- Display to the user in their local time
+- Audit trail
+- Potential rescheduling in the same zone
 
-This is a deterministic workflow-correctness benchmark, not a throughput target.
+### Timezone Conversion Policy
 
-## Demo checklist
+| Scenario | Policy |
+|----------|--------|
+| Normal local time | Converted normally |
+| Ambiguous (DST fall-back) | **Earlier offset** chosen |
+| Nonexistent (DST spring-forward) | **Shifted forward** to next valid local time |
 
-In the demo video, show:
+Uses Java's `ZonedDateTime.atZone().withEarlierOffsetAtOverlap()`.
 
-1. Creating a scheduled item and advancing controlled time to deliver it
-2. Restart recovery for overdue work
-3. One temporary-failure or edit/cancellation recovery path
-4. Duplicate execution without duplicate logical notification
-5. The verification benchmark, architecture, and one important trade-off
+### Why use `version`?
 
-## Decisions you must document
+The version field serves two purposes:
+1. **Delivery key generation** — `deliveryKey = {id}:{version}` ensures edits invalidate prior delivery keys
+2. **Race detection** — workers compare their claimed version against the current DB version before committing delivery
 
-- How local time and time zones become an execution instant
-- How due work is discovered and claimed
-- Which failures are retryable and why
-- The retry limit and delay policy
-- What creates a unique scheduled occurrence
-- How idempotency is enforced at the delivery boundary
-- The edit/cancellation race policy
-- What guarantees change with multiple workers
+### Why use `delivery_key`?
 
-## Out of scope
+The delivery key (`{scheduledWorkId}:{version}`) is the idempotency key at the notification boundary. The `FakeNotificationDestination` tracks which keys have been successfully delivered and returns DUPLICATE for repeated attempts with the same key.
 
-- Natural-language date parsing
-- Recurring schedules
-- Real push, email, SMS, or calendar providers
-- Authentication and multi-tenancy
-- A distributed queue or workflow engine
-- Multi-region scheduling
-- A management dashboard
-- Production secret management
+### Why is the database the source of truth?
 
-Optional work must remain secondary to durable scheduling and recovery.
+In-memory scheduled tasks are lost on process restart. By storing all state in PostgreSQL:
+- Overdue work is discovered via a simple query: `scheduled_at <= now`
+- No work is lost on restart
+- State is inspectable and auditable
 
-## What reviewers will pay attention to
+### Restart Recovery
 
-- Explicit scheduled-work states and valid transitions
-- Separation between schedule storage, due-work discovery, and delivery
-- Durable state rather than in-memory timers as the sole source of truth
-- Idempotency at realistic failure boundaries
-- Correct, explainable time-zone handling
-- Race handling for edit, cancellation, and execution
-- Tests that use controlled time instead of arbitrary sleeps
-- Complexity appropriate for a 6–8-hour exercise
+On application startup:
+1. Find all work in RUNNING state
+2. Reset to SCHEDULED (these were from a crashed worker)
+3. Make immediately eligible for rediscovery
 
-## Follow-up discussion
+Additionally, the due-work query naturally finds overdue SCHEDULED work because `scheduled_at <= current_time` is true for past times.
 
-Be prepared to explain what happens if a user reschedules an item at the same moment a worker has already claimed its previous version.
+### Retry Policy
+
+| Attempt | Delay |
+|---------|-------|
+| 1 | Immediate (0s) |
+| 2 | +10 seconds |
+| 3 | +30 seconds |
+
+- Maximum 3 attempts (configurable via `app.retry.max-attempts`)
+- Only **temporary failures** are retried
+- **Permanent failures** go directly to FAILED
+- After retry exhaustion → FAILED
+
+Why temporary vs permanent?
+- **Temporary**: service unavailable, network timeout, rate limit — may succeed later
+- **Permanent**: invalid recipient, malformed content — will never succeed
+
+### Idempotency
+
+The delivery boundary (NotificationDestination) uses the delivery key as the idempotency key:
+- First successful delivery with key `ABC:1` → notification sent
+- Second delivery with key `ABC:1` → returns DUPLICATE, no notification
+
+This provides one logical delivery per delivery key within the implemented boundary. This is NOT distributed exactly-once — it's a single-process guarantee backed by the fake destination's in-memory state and the database's delivery attempt history.
+
+### Edit Race Policy
+
+If a user edits a reminder while a worker is processing the old version:
+
+```
+Worker claims version 1 → RUNNING
+User edits → version 2, delivery key changes
+Worker attempts delivery with version 1
+Worker re-reads DB → detects version mismatch (1 ≠ 2)
+Worker abandons delivery → no stale notification
+```
+
+### Cancellation Race Policy
+
+> **Cancellation wins if committed before delivery commits.**
+
+```
+Worker claims → RUNNING
+User cancels → CANCELLED
+Worker re-reads DB → detects CANCELLED state
+Worker abandons → no notification recorded
+```
+
+### Multi-Worker Limitations
+
+The conditional claim (`UPDATE ... WHERE state='SCHEDULED' AND version=expected`) prevents two workers from both claiming the same item. However:
+- With a single process, this is straightforward
+- With multiple processes, the database conditional update provides safety, but no distributed coordination is implemented
+- The idempotent delivery boundary provides an additional safety net
+
+## Package Structure
+
+```
+src/main/java/com/example/reminders/
+├── DurableRemindersApplication.java
+├── config/
+│   ├── ClockConfig.java          # Injectable Clock bean
+│   ├── SchedulerConfig.java      # Background scheduler + restart recovery
+│   └── OpenApiConfig.java        # Swagger/OpenAPI metadata
+├── controller/
+│   └── ReminderController.java   # REST API endpoints
+├── dto/
+│   ├── CreateReminderRequest.java
+│   ├── UpdateReminderRequest.java
+│   ├── ReminderResponse.java
+│   └── DeliveryAttemptResponse.java
+├── entity/
+│   ├── ScheduledWork.java        # Main JPA entity
+│   └── DeliveryAttempt.java      # Delivery history entity
+├── exception/
+│   ├── GlobalExceptionHandler.java
+│   ├── InvalidReminderStateException.java
+│   ├── InvalidTimeZoneException.java
+│   └── ReminderNotFoundException.java
+├── model/
+│   ├── AttemptStatus.java        # SUCCESS, TEMPORARY_FAILURE, etc.
+│   ├── DeliveryResult.java       # Result record from destination
+│   └── WorkState.java            # SCHEDULED, RUNNING, DELIVERED, etc.
+├── notification/
+│   ├── NotificationDestination.java      # Interface
+│   └── FakeNotificationDestination.java  # Test/demo implementation
+├── repository/
+│   ├── ScheduledWorkRepository.java
+│   └── DeliveryAttemptRepository.java
+└── service/
+    ├── ReminderService.java      # CRUD + timezone logic
+    ├── DueWorkService.java       # Discovery + claiming + recovery
+    └── DeliveryService.java      # Delivery + retry + race handling
+```
