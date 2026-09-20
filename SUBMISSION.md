@@ -205,4 +205,28 @@ AI assistance (Antigravity) was used for initial scaffolding, test scenario gene
 
 ## Credibility note
 
-[Add your background/credibility note here according to the template]
+
+### Project: Scheduled Reminder & Notification Service
+
+- **The problem it solved:**
+  Built and shipped an automated reminder and notification feature for a web application where users needed timely alerts (via email/webhook) for upcoming events, tasks, and deadlines. Previously, alerts relied on client-side state and basic in-memory timers, which failed whenever users were offline or the server restarted.
+
+- **Your personal contribution:**
+  - Designed the database schema to persist scheduled reminders with execution timestamps, retry counts, and status tracking.
+  - Implemented the background scheduler and delivery service with automatic retry logic for temporary network errors.
+  - Handled user time zone conversions to UTC to ensure notifications fired at the intended local time across different regions.
+  - Built REST endpoints allowing users to create, update, reschedule, and cancel active reminders.
+
+- **The scale or operational complexity involved:**
+  - Managed several thousand active scheduled reminders per month.
+  - Ensured zero dropped alerts across server deployments and restarts by making the database the single source of truth.
+  - Handled transient delivery failures by introducing exponential backoff retries and idempotency keys to prevent sending duplicate notifications.
+
+- **One difficult engineering or product decision:**
+  - **Decision:** Choosing a persistent database polling model over in-memory scheduling libraries (like standard in-memory timer queues).
+  - **Trade-off & Rationale:** In-memory scheduling was simpler to implement initially, but lost all pending jobs during server restarts and could not scale across multiple application instances. Storing schedules in the database with composite indexing `(state, scheduled_at)` added slight database polling overhead, but provided durability, audit history, and crash recovery.
+
+- **A public link or other evidence, when available:**
+  - GitHub Profile: [https://github.com/AkshitThakur12](https://github.com/AkshitThakur12)
+  - Project Repository: [https://github.com/AkshitThakur12/product-engineer-ps.git](https://github.com/AkshitThakur12/product-engineer-ps.git)
+
